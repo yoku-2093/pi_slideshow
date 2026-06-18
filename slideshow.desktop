@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=スライドショー
+Name[en]=Slideshow
+Comment=Google ドライブの写真をスライドショー表示
+Comment[en]=Display photos from Google Drive as a slideshow
+Exec=/home/pi/src/pi_slideshow/slideshow.sh
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;
