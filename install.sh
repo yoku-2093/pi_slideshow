@@ -38,6 +38,18 @@ if command -v xdg-desktop-menu >/dev/null 2>&1; then
     xdg-desktop-menu forceupdate || true
 fi
 
+# TTY 自動切替に必要な openvt/chvt の sudo 権限を設定
+# NOPASSWD で openvt と chvt だけを許可（最小権限）
+SUDOERS_FILE="/etc/sudoers.d/pi-slideshow-vt"
+SUDOERS_LINE="${USER} ALL=(root) NOPASSWD: /usr/bin/openvt, /usr/bin/chvt"
+if ! sudo grep -qF "$SUDOERS_LINE" "$SUDOERS_FILE" 2>/dev/null; then
+    echo "$SUDOERS_LINE" | sudo tee "$SUDOERS_FILE" >/dev/null
+    sudo chmod 440 "$SUDOERS_FILE"
+    echo "- sudoers 設定: $SUDOERS_FILE"
+else
+    echo "- sudoers 設定: 既に設定済み"
+fi
+
 echo "✅ インストール完了"
 echo "- スクリプト: $TARGET_SCRIPT"
 echo "- デスクトップエントリ: $MENU_DESKTOP"

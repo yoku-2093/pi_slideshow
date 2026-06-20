@@ -1,144 +1,99 @@
 # pi_slideshow
 
-Raspberry Pi で画像フォルダをフルスクリーンスライドショー表示するためのシンプルなスクリプトです。  
-起動時にフォルダを選び、一定間隔で画像をランダム表示します。
+Raspberry Pi の画像フォルダを、GUI 上で安定表示するスライドショーツールです。
+
+画像をそのまま順送りするのではなく、`ffmpeg` で 1 本の動画にまとめてから再生します。
+これにより、画像サイズ差による切替ムラを減らしています。
+
+## 仕組み
+
+1. 画像フォルダから concat リストを生成
+2. `ffmpeg` でスライドショー動画（`slideshow_a.mp4` / `slideshow_b.mp4`）を作成
+3. `mpv` で動画を無限ループ再生
+4. フォルダ変更時は裏で新動画を再生成（`pending_video`）
+5. `mpv` の IPC でループ境界（終端→先頭）を検知して切替
+
+このため、再生成直後に途中割り込みせず、次ループ頭で差し替えます。
 
 ## 特徴
 
-- フォルダ選択ダイアログで表示対象を指定
-- 画像を自動リサイズして全画面表示
-- ランダム再生
-- 画面のスリープ/消灯を抑止
-- 画像が追加・削除されてもループ再読込で追従
-- 起動場所に応じてビューアを自動切替（TTY: `fbi` / GUI: `mpv`）
-- 画像表示に連続失敗した場合はプロセスを残さず安全終了
-- GUIモード実行中に画像が追加・削除された場合、一覧を自動更新
+- GUI 専用（TTY 切替なし）
+- 1枚あたり表示時間は `IMAGE_DURATION` で制御
+- 画像追加・削除・更新を定期監視して反映
+- ループ境界での遅延切替（`pending_video`）
+- ログを `~/.local/state/pi_slideshow/slideshow.log` に保存
 
-## ファイル構成
-
-- `slideshow.sh` : スライドショー本体
-- `slideshow.desktop` : デスクトップランチャー定義
-- `install.sh` : スクリプト配置と `.desktop` 更新を自動化
-
-## 動作要件
-
-- Raspberry Pi OS (Debian 系 Linux)
-- X セッション (GUI)
-- Linux 仮想コンソール (`/dev/tty1` など) で実行できること
-- 以下コマンドが利用可能であること
-  - `fbi`
-  - `mpv` (GUI モードで推奨)
-  - `zenity`
-  - `xset`
-  - `setterm`
-
-インストール例:
+## 必要パッケージ
 
 ```bash
 sudo apt update
-sudo apt install -y fbi mpv zenity x11-xserver-utils util-linux
+sudo apt install -y ffmpeg mpv zenity python3
 ```
 
-`slideshow.sh` は TTY を利用するため、`pi` ユーザーが `tty` グループに所属していない場合は先に追加してください。
+## インストール
 
 ```bash
-sudo usermod -aG tty pi
-```
-
-反映には再ログイン（または再起動）が必要です。
-
-## 使い方
-
-通常は `install.sh` の実行だけでセットアップできます。
-
-### 1. インストールを実行
-```bash
+cd /home/pi/src/pi_slideshow
 ./install.sh
 ```
 
-これで次が自動実行されます。
+インストール内容:
 
-- `slideshow.sh` を既定の配置先 `~/.local/share/pi_slideshow` へコピー
-- `.desktop` の `Exec` を実際の配置先に書き換え
-- アプリメニュー用 `.desktop` を `~/.local/share/applications/pi-slideshow.desktop` へ配置
+- `slideshow.sh` を `~/.local/share/pi_slideshow/` へ配置
+- `slideshow.desktop` を `~/.local/share/applications/pi-slideshow.desktop` として配置
+- メニュー更新コマンド実行
 
-### 2. アプリメニューから起動
+## 起動
 
-インストール後はアプリメニューの「スライドショー」から起動できます。
-初回起動時にフォルダ選択ダイアログが開きます。
-GUI 起動時は `mpv` を使用します。`mpv` が未インストールの場合は安全終了します。TTY 起動時は `fbi` を使用します。
+### メニューから
 
-GUI モードの `mpv` は Wayland 環境向けに、`--gpu-context=wayland` と `--hwdec=no` を指定して起動します。
-実行中に画像フォルダへ追加・削除があった場合は変更を検知して `mpv` を再起動し、新しい一覧を反映します。
-スライドショーはプレイリストを繰り返し再生し、`q` で終了できます。
-メモリ使用量を抑えるため、`mpv` はキャッシュ無効化とデマルチプレクサバッファ上限（`8MiB` / `4MiB`）を指定しています。
+アプリメニューの「スライドショー」を起動。
 
-### 3. （必要なら）自動起動を有効化
+### コマンドから
 
 ```bash
-mkdir -p ~/.config/autostart
-cp ~/.local/share/applications/pi-slideshow.desktop ~/.config/autostart/
+~/.local/share/pi_slideshow/slideshow.sh /path/to/images
 ```
 
-## mpv の操作方法（GUIモード）
+引数なしの場合はフォルダ選択ダイアログが開きます。
 
-GUIモードでは `mpv` のキーボード操作が使えます。主なキーは以下です。
+## 主な設定（`slideshow.sh`）
 
-- `q` : 終了
-- `Space` : 一時停止 / 再開
-- `Right` : 次の画像へ
-- `Left` : 前の画像へ
-- `f` : フルスクリーン切替
-- `m` : ミュート切替（動画再生時）
+- `IMAGE_DURATION=10` : 1枚あたり秒数
+- `CHECK_INTERVAL=30` : 画像変更チェック間隔（秒）
+- `POLL_INTERVAL=1` : IPC ポーリング間隔（秒）
+- `TARGET_RESOLUTION="1920:1080"` : 出力動画解像度
+- `LOOP_EDGE_SEC=0.8` : ループ境界判定のしきい値（秒）
 
-補足:
-
-- 本スクリプトは画像スライドショー用途のため、再生中は `--image-display-duration` で自動送りしています。
-- `q` で `mpv` を閉じると、スクリプト全体も終了します。
-
-## カスタマイズ
-
-`slideshow.sh` 内の以下を変更すると挙動を調整できます。
-
-- `DURATION=10` : 1枚あたりの表示秒数
-- `TTY_DEV="/dev/tty1"` : 表示先 TTY
-
-## トラブルシュート
-
-- ダイアログが表示されない
-  - `zenity` がインストールされているか確認
-- 画像が表示されない
-  - 選択フォルダに画像ファイルがあるか確認
-  - `fbi` の実行権限や表示先 TTY を確認
-  - このスクリプトは Linux 仮想コンソール (`/dev/ttyN`) での実行が必要です
-  - `tty` コマンドが `/dev/tty1` などを返す端末で実行してください（`/dev/pts/*` は不可）
-  - `Ctrl + Alt + F1` で `tty1` を確認（環境により `F2` など別TTYの場合あり）
-  - `fbi` が短時間終了を連続するとスクリプトは安全終了します
-- 画面が消灯する
-  - `xset` が利用可能なディスプレイ `:0` で動作しているか確認
-- アプリメニューに表示されない
-  - `./install.sh` を再実行
-  - 反映コマンドを手動実行
-
-```bash
-update-desktop-database ~/.local/share/applications
-xdg-desktop-menu forceupdate
-```
-
-  - それでも表示されない場合はログアウト/ログイン（必要なら再起動）
-
-## ログ
-
-実行ログは以下に保存されます。
-
-- `~/.local/state/pi_slideshow/slideshow.log`
-
-確認例:
+## ログ確認
 
 ```bash
 tail -f ~/.local/state/pi_slideshow/slideshow.log
 ```
 
-## 補足
+## 停止方法（VNC/GUIから）
 
-このスクリプトはシンプルさを重視した構成です。必要に応じて、対象拡張子の絞り込みやログ出力などを追加してください。
+```bash
+pkill -f slideshow.sh || true
+pkill -x mpv || true
+```
+
+## トラブルシュート
+
+- 画像が反映されない
+  - `CHECK_INTERVAL` の間隔後に再生成されます
+  - ログに `更新動画を準備しました` が出るか確認
+
+- 切替がぎこちない
+  - ループ境界切替時にわずかな切れ目が出る場合があります
+  - `TARGET_RESOLUTION` と `IMAGE_DURATION` を調整すると改善することがあります
+
+- 再生が始まらない
+  - `DISPLAY` がある GUI セッションで起動しているか確認
+  - `ffmpeg`, `mpv`, `python3` がインストール済みか確認
+
+## ファイル構成
+
+- `slideshow.sh` : 本体
+- `slideshow.desktop` : デスクトップエントリ
+- `install.sh` : 配置・メニュー更新
