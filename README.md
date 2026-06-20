@@ -21,13 +21,14 @@ Raspberry Pi の画像フォルダを、GUI 上で安定表示するスライド
 - 1枚あたり表示時間は `IMAGE_DURATION` で制御
 - 画像追加・削除・更新を定期監視して反映
 - ループ境界での遅延切替（`pending_video`）
+- 初期動画生成中は `yad` で待機ダイアログを表示
 - ログを `~/.local/state/pi_slideshow/slideshow.log` に保存
 
 ## 必要パッケージ
 
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg mpv zenity python3
+sudo apt install -y ffmpeg mpv zenity python3 yad
 ```
 
 ## インストール

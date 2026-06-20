@@ -2,6 +2,7 @@
 set -u
 
 PLAYER_PID=""
+BUSY_DIALOG_PID=""
 
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pi_slideshow"
 LOG_FILE="$LOG_DIR/slideshow.log"
@@ -62,7 +63,43 @@ cleanup_child() {
         wait "$PLAYER_PID" 2>/dev/null || true
     fi
     PLAYER_PID=""
+    if [ -n "$BUSY_DIALOG_PID" ] && kill -0 "$BUSY_DIALOG_PID" 2>/dev/null; then
+        kill "$BUSY_DIALOG_PID" 2>/dev/null || true
+        wait "$BUSY_DIALOG_PID" 2>/dev/null || true
+    fi
+    BUSY_DIALOG_PID=""
     rm -f "$IPC_SOCKET"
+}
+
+show_busy_start() {
+    # Input: none
+    # Output: visible busy dialog (yad) or fallback log
+    # Return: 0
+    if [ -n "${DISPLAY:-}" ] && command -v yad >/dev/null 2>&1; then
+        # 前回異常終了時の取り残しダイアログを先に掃除する。
+        pkill -f "yad --title=スライドショー" 2>/dev/null || true
+        yad --title="スライドショー" \
+            --text="\n\n\n初期動画を生成中です...\n" \
+            --text-align=center \
+            --no-buttons --on-top --center --fixed --geometry=320x90 \
+            --undecorated --skip-taskbar --no-wrap 2>/dev/null &
+        BUSY_DIALOG_PID=$!
+        return 0
+    fi
+
+    log "【生成中】初期動画を生成しています..."
+}
+
+show_busy_end() {
+    # Input: none
+    # Output: close busy dialog if open
+    # Return: 0
+    if [ -n "$BUSY_DIALOG_PID" ] && kill -0 "$BUSY_DIALOG_PID" 2>/dev/null; then
+        kill "$BUSY_DIALOG_PID" 2>/dev/null || true
+        wait "$BUSY_DIALOG_PID" 2>/dev/null || true
+    fi
+    pkill -f "yad --title=スライドショー" 2>/dev/null || true
+    BUSY_DIALOG_PID=""
 }
 
 handle_signal() {
@@ -292,23 +329,14 @@ fi
 log "選択フォルダ: $IMAGE_DIR"
 log "画像表示秒数: $IMAGE_DURATION"
 
-# バックグラウンドで処理中ダイアログを表示
-ZENITY_PID=""
-if command -v zenity >/dev/null 2>&1; then
-    zenity --progress --no-cancel --title="スライドショー" --text="初期動画を生成中です..." /dev/null 2>/dev/null &
-    ZENITY_PID=$!
-fi
+show_busy_start
 
 sig="$(image_signature "$IMAGE_DIR")"
 if ! build_video "$IMAGE_DIR" "$VIDEO_A"; then
-    [ -n "$ZENITY_PID" ] && kill "$ZENITY_PID" 2>/dev/null || true
+    show_busy_end
     show_error "初期動画生成に失敗しました。画像ファイル形式を確認してください。"
     exit 1
 fi
-
-# 動画生成完了、ダイアログを閉じる
-[ -n "$ZENITY_PID" ] && kill "$ZENITY_PID" 2>/dev/null || true
-sleep 0.3  # ダイアログが消える時間を稼ぐ
 
 ACTIVE_VIDEO="$VIDEO_A"
 PENDING_VIDEO=""
@@ -316,9 +344,12 @@ PENDING_SIG=""
 prev_sig="$sig"
 
 if ! start_player "$ACTIVE_VIDEO"; then
+    show_busy_end
     show_error "動画再生に失敗しました。"
     exit 1
 fi
+
+show_busy_end
 
 next_sig_check=$(( $(date +%s) + CHECK_INTERVAL ))
 prev_time=""
