@@ -292,11 +292,23 @@ fi
 log "選択フォルダ: $IMAGE_DIR"
 log "画像表示秒数: $IMAGE_DURATION"
 
+# バックグラウンドで処理中ダイアログを表示
+ZENITY_PID=""
+if command -v zenity >/dev/null 2>&1; then
+    zenity --progress --no-cancel --title="スライドショー" --text="初期動画を生成中です..." /dev/null 2>/dev/null &
+    ZENITY_PID=$!
+fi
+
 sig="$(image_signature "$IMAGE_DIR")"
 if ! build_video "$IMAGE_DIR" "$VIDEO_A"; then
+    [ -n "$ZENITY_PID" ] && kill "$ZENITY_PID" 2>/dev/null || true
     show_error "初期動画生成に失敗しました。画像ファイル形式を確認してください。"
     exit 1
 fi
+
+# 動画生成完了、ダイアログを閉じる
+[ -n "$ZENITY_PID" ] && kill "$ZENITY_PID" 2>/dev/null || true
+sleep 0.3  # ダイアログが消える時間を稼ぐ
 
 ACTIVE_VIDEO="$VIDEO_A"
 PENDING_VIDEO=""
