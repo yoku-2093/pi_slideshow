@@ -71,30 +71,3 @@ cd /home/pi/src/pi_slideshow
 ```bash
 tail -f ~/.local/state/pi_slideshow/slideshow.log
 ```
-
-## 停止方法（VNC/GUIから）
-
-```bash
-pkill -f slideshow.sh || true
-pkill -x mpv || true
-```
-
-## トラブルシュート
-
-- 画像が反映されない
-  - `CHECK_INTERVAL` の間隔後に再生成されます
-  - ログに `更新動画を準備しました` が出るか確認
-
-- 切替がぎこちない
-  - ループ境界切替時にわずかな切れ目が出る場合があります
-  - `TARGET_RESOLUTION` と `IMAGE_DURATION` を調整すると改善することがあります
-
-- 再生が始まらない
-  - `DISPLAY` がある GUI セッションで起動しているか確認
-  - `ffmpeg`, `mpv`, `python3` がインストール済みか確認
-
-## ファイル構成
-
-- `slideshow.sh` : 本体
-- `slideshow.desktop` : デスクトップエントリ
-- `install.sh` : 配置・メニュー更新

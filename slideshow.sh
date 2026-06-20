@@ -20,8 +20,8 @@ exec >>"$LOG_FILE" 2>&1
 IMAGE_DURATION=10
 # 画像フォルダを再走査して変更を検知する間隔（秒）。
 CHECK_INTERVAL=30
-# メインループの待機間隔（秒）。再生プロセス監視とIPCポーリングに使う。
-POLL_INTERVAL=1
+# メインループの待機間隔（秒）。短くすると境界検知の取りこぼしが減る。
+POLL_INTERVAL=0.2
 # 出力動画の解像度（幅:高さ）。画像は比率維持で余白付き配置される。
 TARGET_RESOLUTION="1920:1080"
 # 生成動画のフレームレート。静止画スライドなので低FPSほど軽い。
@@ -33,7 +33,11 @@ ENCODE_CRF=28
 # ループ境界を判定する余白（秒）。
 # 直前のtime-posが終端側この範囲内、かつ現在のtime-posが先頭側この範囲内なら
 # 「1ループ終了して先頭に戻った」と判定する。
-LOOP_EDGE_SEC=0.8
+LOOP_EDGE_SEC=1.5
+# ループ境界を取りこぼした場合の保険（最小待機秒）。
+# 実際の強制切替秒は「動画長 x FORCE_SWITCH_FACTOR」と比較して大きい方を使う。
+FORCE_SWITCH_MIN_SEC=120
+FORCE_SWITCH_FACTOR=1.2
 
 log() {
     # Input: $* (log message)
@@ -92,14 +96,18 @@ show_busy_start() {
 
 show_busy_end() {
     # Input: none
-    # Output: close busy dialog if open
+    # Output: close busy dialog asynchronously after short delay
     # Return: 0
-    if [ -n "$BUSY_DIALOG_PID" ] && kill -0 "$BUSY_DIALOG_PID" 2>/dev/null; then
-        kill "$BUSY_DIALOG_PID" 2>/dev/null || true
-        wait "$BUSY_DIALOG_PID" 2>/dev/null || true
-    fi
-    pkill -f "yad --title=スライドショー" 2>/dev/null || true
+    local pid="$BUSY_DIALOG_PID"
     BUSY_DIALOG_PID=""
+
+    (
+        sleep 2
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    ) &
 }
 
 handle_signal() {
@@ -273,6 +281,8 @@ is_loop_boundary() {
     awk -v p="$prev" -v c="$curr" -v d="$dur" -v e="$LOOP_EDGE_SEC" 'BEGIN {
         if (d <= (e * 2)) exit 1;
         if (p >= (d - e) && c <= e) exit 0;
+        # time-pos が急に小さくなった場合もループ境界とみなす（取りこぼし対策）。
+        if ((c + e) < p) exit 0;
         exit 1;
     }'
 }
@@ -338,9 +348,12 @@ if ! build_video "$IMAGE_DIR" "$VIDEO_A"; then
     exit 1
 fi
 
+show_busy_end
+
 ACTIVE_VIDEO="$VIDEO_A"
 PENDING_VIDEO=""
 PENDING_SIG=""
+PENDING_SINCE=0
 prev_sig="$sig"
 
 if ! start_player "$ACTIVE_VIDEO"; then
@@ -348,8 +361,6 @@ if ! start_player "$ACTIVE_VIDEO"; then
     show_error "動画再生に失敗しました。"
     exit 1
 fi
-
-show_busy_end
 
 next_sig_check=$(( $(date +%s) + CHECK_INTERVAL ))
 prev_time=""
@@ -374,6 +385,7 @@ while true; do
             if build_video "$IMAGE_DIR" "$target"; then
                 PENDING_VIDEO="$target"
                 PENDING_SIG="$sig"
+                PENDING_SINCE="$now"
                 log "更新動画を準備しました。次ループ境界で切り替えます"
             else
                 log "WARN: 更新動画の再生成に失敗しました"
@@ -394,12 +406,37 @@ while true; do
                     prev_sig="$PENDING_SIG"
                     PENDING_VIDEO=""
                     PENDING_SIG=""
+                    PENDING_SINCE=0
                     prev_time=""
                 else
                     log "WARN: 更新動画への切替に失敗しました"
                 fi
             else
                 prev_time="$cur"
+            fi
+        fi
+
+        # 境界判定を取りこぼしても、動画長に応じた待機時間を超えたら強制切替する。
+        if [ -n "$PENDING_VIDEO" ] && [ "$PENDING_SINCE" -gt 0 ]; then
+            elapsed=$(( now - PENDING_SINCE ))
+            force_switch_sec="$(awk -v d="$dur" -v m="$FORCE_SWITCH_MIN_SEC" -v f="$FORCE_SWITCH_FACTOR" 'BEGIN {
+                t = int((d * f) + 0.5);
+                if (t < m) t = m;
+                print t;
+            }')"
+
+            if [ "$elapsed" -ge "$force_switch_sec" ]; then
+                log "ループ境界未検知が継続したため、更新動画へ強制切替します (elapsed=${elapsed}s, threshold=${force_switch_sec}s)"
+                if start_player "$PENDING_VIDEO"; then
+                    ACTIVE_VIDEO="$PENDING_VIDEO"
+                    prev_sig="$PENDING_SIG"
+                    PENDING_VIDEO=""
+                    PENDING_SIG=""
+                    PENDING_SINCE=0
+                    prev_time=""
+                else
+                    log "WARN: 強制切替に失敗しました"
+                fi
             fi
         fi
     fi
