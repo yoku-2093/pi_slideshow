@@ -19,15 +19,33 @@ fi
 
 mkdir -p "$INSTALL_DIR" "$APP_DIR"
 
-cp "$SOURCE_SCRIPT" "$TARGET_SCRIPT"
-chmod +x "$TARGET_SCRIPT"
+# 稼働中インスタンスがあれば警告する。
+# bash は実行中スクリプトをバイト位置で逐次読むため、内容を直接上書きすると
+# 行ズレで "command not found" や "syntax error" を引き起こす。
+if pgrep -f "$TARGET_SCRIPT" >/dev/null 2>&1; then
+    echo "⚠ 稼働中のスライドショーを検出しました。"
+    echo "  反映には一度終了して再起動してください（pkill -f slideshow.sh）。"
+fi
 
-cp "$SOURCE_DESKTOP" "$TARGET_DESKTOP"
+# 原子的置換でスクリプトを配置する。
+# 同一ディレクトリの一時ファイルに書き出してから mv することで、
+# 置換は inode の入れ替えになり、稼働中プロセスは旧 inode を読み続ける。
+# これにより上書き起因の行ズレ破損を防ぐ。
+tmp_script="$(mktemp "$INSTALL_DIR/.slideshow.sh.XXXXXX")"
+cp "$SOURCE_SCRIPT" "$tmp_script"
+chmod +x "$tmp_script"
+mv -f "$tmp_script" "$TARGET_SCRIPT"
+
+tmp_desktop="$(mktemp "$INSTALL_DIR/.slideshow.desktop.XXXXXX")"
+cp "$SOURCE_DESKTOP" "$tmp_desktop"
 escaped_exec=$(printf '%s\n' "$TARGET_SCRIPT" | sed 's/[&|]/\\&/g')
-sed -i "s|^Exec=.*|Exec=$escaped_exec|" "$TARGET_DESKTOP"
+sed -i "s|^Exec=.*|Exec=$escaped_exec|" "$tmp_desktop"
+mv -f "$tmp_desktop" "$TARGET_DESKTOP"
 
-cp "$TARGET_DESKTOP" "$MENU_DESKTOP"
-chmod 644 "$MENU_DESKTOP"
+tmp_menu="$(mktemp "$APP_DIR/.pi-slideshow.desktop.XXXXXX")"
+cp "$TARGET_DESKTOP" "$tmp_menu"
+chmod 644 "$tmp_menu"
+mv -f "$tmp_menu" "$MENU_DESKTOP"
 
 # メニューに即時反映されるよう、利用可能な更新コマンドを実行
 if command -v update-desktop-database >/dev/null 2>&1; then
