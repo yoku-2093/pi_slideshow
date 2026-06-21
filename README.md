@@ -31,6 +31,21 @@ sudo apt update
 sudo apt install -y ffmpeg mpv zenity python3 yad
 ```
 
+## 対応画像形式
+
+以下の形式に対応しています：
+
+- JPG / JPEG
+- PNG
+- GIF
+- BMP
+- WebP
+- HEIF / HEIC
+
+HEIF / HEIC 形式（iPhone や Google Photos で使われることがあります）は、
+動画生成時に自動で一時 JPG へ変換してから使用します。
+元のフォルダ内のファイルは変更しません（変換ファイルは作業ディレクトリに作成されます）。
+
 ## インストール
 
 ```bash

@@ -125,7 +125,7 @@ collect_images() {
     # Return: 0
     local dir="$1"
     find "$dir" -maxdepth 1 -type f \
-        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' \) \
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' -o -iname '*.heif' -o -iname '*.heic' \) \
         -print 2>/dev/null | sort
 }
 
@@ -148,9 +148,22 @@ generate_concat_list() {
     : >"$LIST_FILE"
 
     while IFS= read -r img; do
-        printf "file '%s'\n" "${img//\'/'\\'''}" >>"$LIST_FILE"
+        local use_img="$img"
+        # Convert HEIF/HEIC on-the-fly to temporary JPG if needed
+        case "$img" in
+            *.heif|*.HEIF|*.heic|*.HEIC)
+                local tmp_jpg="$WORK_DIR/temp_$(basename "${img%.*}").jpg"
+                if ffmpeg -y -hide_banner -loglevel error -i "$img" "$tmp_jpg" 2>/dev/null; then
+                    use_img="$tmp_jpg"
+                else
+                    log "WARN: HEIF 変換失敗: $img"
+                    continue
+                fi
+                ;;
+        esac
+        printf "file '%s'\n" "${use_img//\'/'\\'''}" >>"$LIST_FILE"
         printf "duration %s\n" "$IMAGE_DURATION" >>"$LIST_FILE"
-        last="$img"
+        last="$use_img"
     done < <(collect_images "$dir")
 
     # concat demuxer needs the last file repeated so its duration applies.
