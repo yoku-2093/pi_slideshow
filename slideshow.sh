@@ -141,6 +141,35 @@ image_signature() {
     done | sha256sum | awk '{print $1}'
 }
 
+auto_orient_inplace() {
+    # Input: $1 (jpg file path)
+    # Output: none (rewrites file with EXIF rotation baked into pixels)
+    # Return: 0
+    # HEIF/iPhone 由来の JPG は EXIF Orientation(例:6=90度回転)を持つが、
+    # ffmpeg の concat demuxer はこのタグを無視して横倒しのまま再生してしまう。
+    # ここで PIL を使い回転を実ピクセルへ適用しタグを除去することで、
+    # 再生エンジンに依存せず常に正しい向きで表示させる。
+    local f="$1"
+    python3 - "$f" <<'PY' 2>/dev/null || true
+import sys
+try:
+    from PIL import Image, ImageOps
+except Exception:
+    sys.exit(0)  # PIL が無ければ何もしない（向き補正をスキップ）
+p = sys.argv[1]
+try:
+    im = Image.open(p)
+    exif = im.getexif()
+    orient = exif.get(0x0112) if exif else None
+    if orient in (None, 0, 1):
+        sys.exit(0)  # 回転不要
+    fixed = ImageOps.exif_transpose(im)  # EXIF回転を実ピクセルへ適用
+    fixed.save(p, quality=92)
+except Exception:
+    sys.exit(0)
+PY
+}
+
 generate_concat_list() {
     # Input: $1 (image directory)
     # Output: LIST_FILE for ffmpeg concat demuxer
@@ -165,6 +194,8 @@ generate_concat_list() {
                     log "WARN: HEIF 変換失敗: $img"
                     continue
                 fi
+                # EXIF Orientation を実ピクセルへ焼き込み、横倒し再生を防ぐ。
+                auto_orient_inplace "$tmp_jpg"
                 ;;
         esac
         printf "file '%s'\n" "${use_img//\'/'\\'''}" >>"$LIST_FILE"
