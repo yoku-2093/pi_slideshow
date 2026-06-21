@@ -293,6 +293,64 @@ except Exception:
 PY
 }
 
+mpv_ipc_command() {
+    # Input: $@ (mpv IPC command words, e.g. loadfile <path> replace)
+    # Output: none
+    # Return: 0 success, 1 failure
+    # mpv の JSON IPC に任意コマンドを送る。loadfile などの制御に使う。
+    python3 - "$IPC_SOCKET" "$@" <<'PY'
+import json
+import socket
+import sys
+
+sock_path = sys.argv[1]
+cmd = sys.argv[2:]
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    s.connect(sock_path)
+    payload = json.dumps({"command": cmd}) + "\n"
+    s.sendall(payload.encode("utf-8"))
+
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+
+    if not data:
+        raise RuntimeError("empty response")
+
+    resp = json.loads(data.decode("utf-8").strip())
+    if resp.get("error") != "success":
+        raise RuntimeError("ipc error")
+except Exception:
+    sys.exit(1)
+PY
+}
+
+switch_video() {
+    # Input: $1 (video path)
+    # Output: none
+    # Return: 0 success, 1 failure
+    # 実行中の mpv に loadfile で新ファイルを読み込ませ、シームレスに切り替える。
+    # mpv を終了・再起動しないため、切替時にデスクトップが一瞬見えることがない。
+    local video="$1"
+    if [ ! -f "$video" ] || [ ! -S "$IPC_SOCKET" ]; then
+        return 1
+    fi
+    if mpv_ipc_command loadfile "$video" replace; then
+        # loadfile 直後はループ設定を確実に効かせるため再指定する。
+        mpv_ipc_command set_property loop-file inf >/dev/null 2>&1 || true
+        log "動画をシームレス切替しました: $(basename "$video")"
+        return 0
+    fi
+    return 1
+}
+
 is_loop_boundary() {
     # Input: $1 prev_time, $2 curr_time, $3 duration
     # Output: none
@@ -426,7 +484,7 @@ while true; do
         if [ -n "$dur" ] && [ -n "$cur" ]; then
             if [ -n "$prev_time" ] && is_loop_boundary "$prev_time" "$cur" "$dur"; then
                 log "ループ境界を検知。更新動画へ切り替えます"
-                if start_player "$PENDING_VIDEO"; then
+                if switch_video "$PENDING_VIDEO"; then
                     ACTIVE_VIDEO="$PENDING_VIDEO"
                     prev_sig="$PENDING_SIG"
                     PENDING_VIDEO=""
@@ -452,7 +510,7 @@ while true; do
 
             if [ "$elapsed" -ge "$force_switch_sec" ]; then
                 log "ループ境界未検知が継続したため、更新動画へ強制切替します (elapsed=${elapsed}s, threshold=${force_switch_sec}s)"
-                if start_player "$PENDING_VIDEO"; then
+                if switch_video "$PENDING_VIDEO"; then
                     ACTIVE_VIDEO="$PENDING_VIDEO"
                     prev_sig="$PENDING_SIG"
                     PENDING_VIDEO=""
