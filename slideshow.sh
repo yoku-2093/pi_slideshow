@@ -23,8 +23,10 @@ CHECK_INTERVAL=30
 # メインループの待機間隔（秒）。短くすると境界検知の取りこぼしが減る。
 POLL_INTERVAL=0.2
 # 出力動画の解像度（幅:高さ）。画像は比率維持で余白付き配置される。
-TARGET_RESOLUTION="1920:1080"
-# 生成動画のフレームレート。静止画スライドなので低FPSほど軽い。
+# 1280:720 は 1920:1080 よりエンコード負荷が軽く、生成が速い。
+TARGET_RESOLUTION="1280:720"
+# 生成動画の最大フレームレート。VFR(可変フレームレート)生成時の上限として使う。
+# 静止画スライドは画像切替時のみフレームを持てば十分なので低めでよい。
 VIDEO_FPS=1
 # エンコード速度優先設定。Raspberry Pi では ultrafast 推奨。
 ENCODE_PRESET="ultrafast"
@@ -149,11 +151,15 @@ generate_concat_list() {
 
     while IFS= read -r img; do
         local use_img="$img"
-        # Convert HEIF/HEIC on-the-fly to temporary JPG if needed
+        # Convert HEIF/HEIC on-the-fly to temporary JPG if needed.
+        # heif-convert (libheif) を優先し、無ければ ffmpeg にフォールバックする。
         case "$img" in
             *.heif|*.HEIF|*.heic|*.HEIC)
                 local tmp_jpg="$WORK_DIR/temp_$(basename "${img%.*}").jpg"
-                if ffmpeg -y -hide_banner -loglevel error -i "$img" "$tmp_jpg" 2>/dev/null; then
+                if command -v heif-convert >/dev/null 2>&1 \
+                    && heif-convert "$img" "$tmp_jpg" >/dev/null 2>&1; then
+                    use_img="$tmp_jpg"
+                elif ffmpeg -y -hide_banner -loglevel error -i "$img" "$tmp_jpg" 2>/dev/null; then
                     use_img="$tmp_jpg"
                 else
                     log "WARN: HEIF 変換失敗: $img"
@@ -198,13 +204,17 @@ build_video() {
     # -f concat -safe 0   use concat list (allows absolute paths)
     # -i LIST_FILE        image list with per-image duration
     # -vf ...             normalize frame size/format for stable playback
+    # -vsync vfr          可変フレームレート出力。画像切替点のみフレームを持つため
+    #                     1fps CFR のように同一フレームを量産せず、生成が大幅に速い。
+    #                     concat の duration がそのまま各画像の表示時間になる。
     # -c:v libx264        H.264 encode
     # -preset ultrafast   prioritize encode speed on low-power devices
     # -crf 28             quality/size balance (higher = smaller/faster)
     # -movflags +faststart place metadata at file head
     if ! ffmpeg -y -hide_banner -loglevel error \
         -f concat -safe 0 -i "$LIST_FILE" \
-        -vf "fps=${VIDEO_FPS},scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+        -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+        -vsync vfr \
         -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" -movflags +faststart \
         "$tmp_video"; then
         rm -f "$tmp_video"
@@ -388,7 +398,9 @@ while true; do
 
     if [ "$now" -ge "$next_sig_check" ]; then
         sig="$(image_signature "$IMAGE_DIR")"
-        if [ "$sig" != "$prev_sig" ]; then
+        # 現在の再生中(prev_sig)とも、生成済みの保留動画(PENDING_SIG)とも異なる
+        # 場合のみ再生成する。これにより同じ内容を毎回作り直す無駄を防ぐ。
+        if [ "$sig" != "$prev_sig" ] && [ "$sig" != "$PENDING_SIG" ]; then
             if [ "$ACTIVE_VIDEO" = "$VIDEO_A" ]; then
                 target="$VIDEO_B"
             else
