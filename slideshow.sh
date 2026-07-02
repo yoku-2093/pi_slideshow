@@ -185,14 +185,14 @@ generate_concat_list() {
     # Output: LIST_FILE for ffmpeg concat demuxer
     # Return: 0
     local dir="$1"
-    local last=""
     local use_media=""
     local duration=""
     local is_video=""
     local tmp_jpg=""
     local tmp_raw=""
     local media_list="$WORK_DIR/media_list.txt"
-    local converted_video=""
+    local converted_clip=""
+    local idx=0
 
     : >"$LIST_FILE"
 
@@ -204,8 +204,9 @@ generate_concat_list() {
     : > "$debug_file"
 
     while IFS= read -r media <&3; do
+        idx=$((idx + 1))
         # デバッグ: 読み込んだ値を記録
-        echo "READ: [$media]" >> "$debug_file"
+        echo "READ #${idx}: [$media]" >> "$debug_file"
 
         use_media="$media"
         duration="$IMAGE_DURATION"
@@ -254,43 +255,43 @@ generate_concat_list() {
                 ;;
         esac
 
-        # 動画の場合は静止画像フォーマットに変換する必要がある
-        # concat demuxer で画像と動画を混在させるとタイミング問題が起きるため、
-        # 動画を画像シーケンスに変換してから結合する
+        # すべてのメディア（画像と動画）を統一フォーマットの動画クリップに変換
+        # これにより concat demuxer で画像と動画の混在時の問題を回避
+        converted_clip="$WORK_DIR/clip_$(printf '%03d' $idx).mp4"
+
         if [ "$is_video" = true ]; then
-            converted_video="$WORK_DIR/converted_$(basename "${media%.*}").mp4"
-
-            # 動画の長さを取得
+            # 動画の場合: 元の長さを保持しつつ、解像度とフォーマットを統一
             duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "$IMAGE_DURATION")
+            duration=$(printf "%.2f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
 
-            # 動画を指定解像度にリサイズし、音声を削除
             if ffmpeg -y -hide_banner -loglevel error -i "$use_media" \
                 -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
                 -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" \
                 -an -movflags +faststart \
-                "$converted_video" 2>/dev/null; then
-                use_media="$converted_video"
-                # 整数に丸める
-                duration=$(printf "%.0f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
+                "$converted_clip" 2>/dev/null; then
+                echo "CONVERT VIDEO #${idx}: [$use_media] -> [$converted_clip] duration=${duration}s" >> "$debug_file"
             else
                 log "WARN: 動画変換失敗: $media"
                 continue
             fi
+        else
+            # 画像の場合: IMAGE_DURATION 秒の動画クリップに変換
+            if ffmpeg -y -hide_banner -loglevel error \
+                -loop 1 -i "$use_media" -t "$IMAGE_DURATION" \
+                -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+                -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" \
+                -movflags +faststart \
+                "$converted_clip" 2>/dev/null; then
+                echo "CONVERT IMAGE #${idx}: [$use_media] -> [$converted_clip] duration=${IMAGE_DURATION}s" >> "$debug_file"
+            else
+                log "WARN: 画像変換失敗: $media"
+                continue
+            fi
         fi
 
-        # デバッグ: 書き込み前の値を記録
-        echo "WRITE: [$use_media] duration=$duration" >> "$debug_file"
-
-        # シングルクォートで囲む（シングルクォートを含むパス名は使われない前提）
-        printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
-        printf "duration %s\n" "$duration" >>"$LIST_FILE"
-        last="$use_media"
+        # 変換後の動画クリップをリストに追加（durationディレクティブは不要）
+        printf "file '%s'\n" "$converted_clip" >>"$LIST_FILE"
     done 3< "$media_list"
-
-    # concat demuxer needs the last file repeated so its duration applies.
-    if [ -n "$last" ]; then
-        printf "file '%s'\n" "${last//\'/'\\'''}" >>"$LIST_FILE"
-    fi
 }
 
 build_video() {
@@ -317,23 +318,13 @@ build_video() {
     # -hide_banner        suppress startup banner
     # -loglevel error     show errors (but exit code determines success)
     # -f concat -safe 0   use concat list (allows absolute paths)
-    # -i LIST_FILE        image list with per-image duration
-    # -vf ...             normalize frame size/format for stable playback
-    # -vsync vfr          可変フレームレート出力。画像切替点のみフレームを持つため
-    #                     1fps CFR のように同一フレームを量産せず、生成が大幅に速い。
-    #                     concat の duration がそのまま各画像の表示時間になる。
-    # -c:v libx264        H.264 encode
-    # -preset ultrafast   prioritize encode speed on low-power devices
-    # -crf 28             quality/size balance (higher = smaller/faster)
+    # -i LIST_FILE        pre-converted video clips list
+    # -c copy             すべてのクリップが同じフォーマットなので再エンコード不要（高速）
     # -movflags +faststart place metadata at file head
     # エラー出力は記録するが、終了コードで成否を判定
-    # -an: 音声なし
     ffmpeg_output=$(ffmpeg -y -hide_banner -loglevel error \
         -f concat -safe 0 -i "$LIST_FILE" \
-        -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
-        -vsync vfr \
-        -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" -movflags +faststart \
-        -an \
+        -c copy -movflags +faststart \
         "$tmp_video" 2>&1)
     ffmpeg_exit=$?
 

@@ -41,11 +41,24 @@ if command -v xdg-desktop-menu >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "以下のディレクトリには設定やキャッシュが残っています："
-echo "  - ログ: $HOME/.local/state/pi_slideshow/"
-echo "  - キャッシュ: $HOME/.cache/pi_slideshow/"
-echo ""
-echo "これらも削除する場合は以下のコマンドを実行してください："
-echo "  rm -rf ~/.local/state/pi_slideshow ~/.cache/pi_slideshow"
+LOG_DIR="$HOME/.local/state/pi_slideshow"
+CACHE_DIR="$HOME/.cache/pi_slideshow"
+
+if [ -d "$LOG_DIR" ] || [ -d "$CACHE_DIR" ]; then
+    echo "以下のディレクトリが残っています："
+    [ -d "$LOG_DIR" ] && echo "  - ログ: $LOG_DIR"
+    [ -d "$CACHE_DIR" ] && echo "  - キャッシュ: $CACHE_DIR"
+    echo ""
+    read -p "これらも削除しますか？ (y/N): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        [ -d "$LOG_DIR" ] && rm -rf "$LOG_DIR" && echo "- ログを削除: $LOG_DIR"
+        [ -d "$CACHE_DIR" ] && rm -rf "$CACHE_DIR" && echo "- キャッシュを削除: $CACHE_DIR"
+    else
+        echo "ログとキャッシュは保持されました"
+        echo "手動で削除する場合: rm -rf ~/.local/state/pi_slideshow ~/.cache/pi_slideshow"
+    fi
+fi
+
 echo ""
 echo "✅ アンインストール完了"
