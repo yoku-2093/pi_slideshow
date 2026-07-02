@@ -266,46 +266,69 @@ convert_video_to_clip() {
     return 1
 }
 
-process_image() {
-    # Input: $1=image_path
-    # Output: processed image path (for HEIF/HEIC conversion)
+convert_image_to_clip() {
+    # Input: $1=index $2=image_path
+    # Output: single-frame video clip path
     # Return: 0 success, 1 failure
-    local media="$1"
+    local idx="$1"
+    local image="$2"
+    local use_image="$image"
+    local converted_clip="$WORK_DIR/image_$(printf '%03d' $idx).mp4"
+    local cache_key=$(get_media_cache_key "$image")
+    local cache_meta="$WORK_DIR/image_$(printf '%03d' $idx).meta"
     local tmp_jpg=""
     local tmp_raw=""
 
+    # キャッシュチェック
+    if [ -f "$cache_meta" ] && [ -f "$converted_clip" ]; then
+        if [ "$(cat "$cache_meta" 2>/dev/null)" = "$cache_key" ]; then
+            echo "$converted_clip"
+            return 0
+        fi
+    fi
+
     # HEIF/HEIC を JPG に変換
-    case "$media" in
+    case "$image" in
         *.heif|*.HEIF|*.heic|*.HEIC)
-            tmp_jpg="$WORK_DIR/temp_$(basename "${media%.*}").jpg"
-            tmp_raw="$WORK_DIR/temp_raw_$(basename "${media%.*}").jpg"
+            tmp_jpg="$WORK_DIR/temp_$(basename "${image%.*}").jpg"
+            tmp_raw="$WORK_DIR/temp_raw_$(basename "${image%.*}").jpg"
 
             if command -v heif-convert >/dev/null 2>&1; then
-                if heif-convert "$media" "$tmp_raw" >/dev/null 2>&1; then
+                if heif-convert "$image" "$tmp_raw" >/dev/null 2>&1; then
                     if check_needs_rotation "$tmp_raw"; then
                         if apply_rotation "$tmp_raw" "$tmp_jpg"; then
+                            use_image="$tmp_jpg"
                             rm -f "$tmp_raw"
-                            echo "$tmp_jpg"
-                            return 0
                         else
                             mv -f "$tmp_raw" "$tmp_jpg"
-                            echo "$tmp_jpg"
-                            return 0
+                            use_image="$tmp_jpg"
                         fi
                     else
                         mv -f "$tmp_raw" "$tmp_jpg"
-                        echo "$tmp_jpg"
-                        return 0
+                        use_image="$tmp_jpg"
                     fi
+                else
+                    return 1
                 fi
+            else
+                return 1
             fi
-            return 1
-            ;;
-        *)
-            echo "$media"
-            return 0
             ;;
     esac
+
+    # 画像を1フレームの動画に変換（超高速）
+    if ffmpeg -y -hide_banner -loglevel error \
+        -loop 1 -i "$use_image" -vframes 1 \
+        -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+        -c:v libx264 -preset ultrafast -crf 23 \
+        -movflags +faststart \
+        "$converted_clip" 2>/dev/null; then
+        echo "$cache_key" > "$cache_meta"
+        echo "$converted_clip"
+        return 0
+    fi
+
+    return 1
 }
 
 generate_concat_list() {
@@ -332,56 +355,11 @@ generate_concat_list() {
 
     collect_media "$dir" > "$media_list"
     local total_count=$(wc -l < "$media_list")
+    local image_idx=0
 
-    # まず動画の数をカウント
-    video_count=$(grep -iE '\.(mp4|mov|avi|mkv|webm)$' "$media_list" | wc -l)
+    log "全メディアを1フレーム動画に変換中: ${total_count}件"
 
-    if [ "$video_count" -gt 0 ]; then
-        log "動画を変換中: ${video_count}件"
-    fi
-
-    # 動画のみ並列で事前変換
-    while IFS= read -r media <&3; do
-        case "$media" in
-            *.mp4|*.MP4|*.mov|*.MOV|*.avi|*.AVI|*.mkv|*.MKV|*.webm|*.WEBM)
-                video_idx=$((video_idx + 1))
-                (
-                    result=$(convert_video_to_clip "$video_idx" "$media" "$encoder")
-                    if [ -n "$result" ]; then
-                        echo "$video_idx|$result" > "$WORK_DIR/video_result_${video_idx}.txt"
-                    fi
-                ) &
-
-                pids+=($!)
-                parallel_count=$((parallel_count + 1))
-
-                # 並列数制限
-                if [ "$parallel_count" -ge "$MAX_PARALLEL" ]; then
-                    wait "${pids[@]}"
-                    pids=()
-                    parallel_count=0
-                fi
-                ;;
-        esac
-    done 3< "$media_list"
-
-    # 残りの動画変換を待機
-    if [ ${#pids[@]} -gt 0 ]; then
-        wait "${pids[@]}"
-    fi
-
-    # 変換済み動画をマップに格納（連想配列）
-    declare -A video_map
-    for result_file in "$WORK_DIR"/video_result_*.txt; do
-        [ -f "$result_file" ] || continue
-        while IFS='|' read -r v_idx converted_path; do
-            video_map[$v_idx]="$converted_path"
-        done < "$result_file"
-    done
-
-    # concatリスト生成: 画像はそのまま、動画は変換済みパスを使用
-    idx=0
-    video_idx=0
+    # すべてのメディア（画像・動画）を並列で1フレーム動画に変換
     while IFS= read -r media <&3; do
         idx=$((idx + 1))
         is_video=false
@@ -391,34 +369,68 @@ generate_concat_list() {
                 is_video=true
                 video_idx=$((video_idx + 1))
                 ;;
+            *)
+                image_idx=$((image_idx + 1))
+                ;;
         esac
 
-        if [ "$is_video" = "true" ]; then
-            # 変換済み動画を使用
-            use_media="${video_map[$video_idx]}"
-            [ -z "$use_media" ] && continue
-            # 動画の実際の長さを取得
-            local video_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "1")
-            printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
-            printf "duration %s\n" "$video_duration" >>"$LIST_FILE"
-        else
-            # 画像はそのまま使用（HEIF/HEICのみ変換）
-            use_media=$(process_image "$media")
-            [ -z "$use_media" ] && continue
-            printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
-            printf "duration %s\n" "$IMAGE_DURATION" >>"$LIST_FILE"
-        fi
+        # 並列変換
+        (
+            if [ "$is_video" = "true" ]; then
+                result=$(convert_video_to_clip "$video_idx" "$media" "$encoder")
+                type="video"
+            else
+                result=$(convert_image_to_clip "$image_idx" "$media")
+                type="image"
+            fi
+            if [ -n "$result" ]; then
+                echo "$idx|$type|$result" > "$WORK_DIR/media_result_${idx}.txt"
+            fi
+        ) &
 
-        last="$use_media"
+        pids+=($!)
+        parallel_count=$((parallel_count + 1))
+
+        # 並列数制限
+        if [ "$parallel_count" -ge "$MAX_PARALLEL" ]; then
+            wait "${pids[@]}"
+            pids=()
+            parallel_count=0
+        fi
     done 3< "$media_list"
 
-    # concat demuxer needs the last file repeated ONLY if it's not a video
-    # (videos have their own duration, images need the duration directive)
-    if [ -n "$last" ] && [ "$is_video" != "true" ]; then
+    # 残りの変換を待機
+    if [ ${#pids[@]} -gt 0 ]; then
+        wait "${pids[@]}"
+    fi
+
+    # 結果をインデックス順にソートしてリストに追加
+    for result_file in "$WORK_DIR"/media_result_*.txt; do
+        [ -f "$result_file" ] || continue
+        while IFS='|' read -r idx_val type_val path_val; do
+            echo "$idx_val|$type_val|$path_val"
+        done < "$result_file"
+    done | sort -t'|' -k1 -n | while IFS='|' read -r idx_val type_val path_val; do
+        [ -z "$path_val" ] && continue
+
+        # 動画はその動画の長さ、画像はIMAGE_DURATION
+        if [ "$type_val" = "video" ]; then
+            local media_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$path_val" 2>/dev/null || echo "1")
+        else
+            local media_duration="$IMAGE_DURATION"
+        fi
+
+        printf "file '%s'\n" "$path_val" >>"$LIST_FILE"
+        printf "duration %s\n" "$media_duration" >>"$LIST_FILE"
+        last="$path_val"
+    done
+
+    # concat demuxer needs the last file repeated
+    if [ -n "$last" ]; then
         printf "file '%s'\n" "$last" >>"$LIST_FILE"
     fi
 
-    rm -f "$WORK_DIR"/video_result_*.txt
+    rm -f "$WORK_DIR"/media_result_*.txt
 }
 
 build_video() {
