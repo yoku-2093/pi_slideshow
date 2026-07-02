@@ -106,7 +106,7 @@ cleanup_child() {
     # Input: none
     # Output: none
     # Return: 0
-    # Side effect: terminate player and clear PLAYER_PID
+    # Side effect: terminate player, dialogs and cleanup temporary files
     if [ -n "$PLAYER_PID" ] && kill -0 "$PLAYER_PID" 2>/dev/null; then
         kill "$PLAYER_PID" 2>/dev/null || true
         wait "$PLAYER_PID" 2>/dev/null || true
@@ -226,30 +226,53 @@ apply_rotation() {
     fi
 }
 
-convert_media_to_clip() {
-    # Input: $1=index $2=media_path $3=is_video $4=encoder
-    # Output: writes clip file
-    # Return: 0 success, 1 failure
+convert_video_to_clip() {
+    # Input: $1=index $2=video_path $3=encoder
+    # Output: writes converted video clip
+    # Return: 0 success, 1 failure (outputs converted path on success)
     local idx="$1"
-    local media="$2"
-    local is_video="$3"
-    local encoder="$4"
-    local use_media="$media"
-    local converted_clip="$WORK_DIR/clip_$(printf '%03d' $idx).mp4"
-    local cache_key=$(get_media_cache_key "$media")
-    local cache_meta="$WORK_DIR/clip_$(printf '%03d' $idx).meta"
-    local tmp_jpg=""
-    local tmp_raw=""
-    local duration=""
+    local video="$2"
+    local encoder="$3"
+    local converted_clip="$WORK_DIR/video_$(printf '%03d' $idx).mp4"
+    local cache_key=$(get_media_cache_key "$video")
+    local cache_meta="$WORK_DIR/video_$(printf '%03d' $idx).meta"
     local encoder_opts=""
 
-    # キャッシュチェック: metaファイルとクリップが存在し、cache_keyが一致すればスキップ
+    # キャッシュチェック
     if [ -f "$cache_meta" ] && [ -f "$converted_clip" ]; then
         if [ "$(cat "$cache_meta" 2>/dev/null)" = "$cache_key" ]; then
             echo "$converted_clip"
             return 0
         fi
     fi
+
+    # GPUエンコーダー優先
+    if [ "$encoder" = "h264_v4l2m2m" ] || [ "$encoder" = "h264_omx" ]; then
+        encoder_opts="-c:v $encoder -b:v 2M"
+    else
+        encoder_opts="-c:v libx264 -preset $ENCODE_PRESET -crf $ENCODE_CRF"
+    fi
+
+    if ffmpeg -y -hide_banner -loglevel error -i "$video" \
+        -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+        -r "$ENCODE_FPS" $encoder_opts \
+        -an -movflags +faststart \
+        "$converted_clip" 2>/dev/null; then
+        echo "$cache_key" > "$cache_meta"
+        echo "$converted_clip"
+        return 0
+    fi
+
+    return 1
+}
+
+process_image() {
+    # Input: $1=image_path
+    # Output: processed image path (for HEIF/HEIC conversion)
+    # Return: 0 success, 1 failure
+    local media="$1"
+    local tmp_jpg=""
+    local tmp_raw=""
 
     # HEIF/HEIC を JPG に変換
     case "$media" in
@@ -261,62 +284,28 @@ convert_media_to_clip() {
                 if heif-convert "$media" "$tmp_raw" >/dev/null 2>&1; then
                     if check_needs_rotation "$tmp_raw"; then
                         if apply_rotation "$tmp_raw" "$tmp_jpg"; then
-                            use_media="$tmp_jpg"
                             rm -f "$tmp_raw"
+                            echo "$tmp_jpg"
+                            return 0
                         else
                             mv -f "$tmp_raw" "$tmp_jpg"
-                            use_media="$tmp_jpg"
+                            echo "$tmp_jpg"
+                            return 0
                         fi
                     else
                         mv -f "$tmp_raw" "$tmp_jpg"
-                        use_media="$tmp_jpg"
+                        echo "$tmp_jpg"
+                        return 0
                     fi
-                else
-                    return 1
                 fi
-            else
-                return 1
             fi
+            return 1
+            ;;
+        *)
+            echo "$media"
+            return 0
             ;;
     esac
-
-    # エンコーダー別オプション
-    if [ "$encoder" = "h264_v4l2m2m" ] || [ "$encoder" = "h264_omx" ]; then
-        # GPU: presetとcrfは使えない
-        encoder_opts="-c:v $encoder -b:v 2M"
-    else
-        # CPU: libx264
-        encoder_opts="-c:v libx264 -preset $ENCODE_PRESET -crf $ENCODE_CRF"
-    fi
-
-    if [ "$is_video" = "true" ]; then
-        # 動画変換
-        duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "$IMAGE_DURATION")
-
-        if ffmpeg -y -hide_banner -loglevel error -i "$use_media" \
-            -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
-            -r "$ENCODE_FPS" $encoder_opts \
-            -an -movflags +faststart \
-            "$converted_clip" 2>/dev/null; then
-            echo "$cache_key" > "$cache_meta"
-            echo "$converted_clip"
-            return 0
-        fi
-    else
-        # 画像変換
-        if ffmpeg -y -hide_banner -loglevel error \
-            -loop 1 -i "$use_media" -t "$IMAGE_DURATION" \
-            -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
-            -r "$ENCODE_FPS" $encoder_opts \
-            -movflags +faststart \
-            "$converted_clip" 2>/dev/null; then
-            echo "$cache_key" > "$cache_meta"
-            echo "$converted_clip"
-            return 0
-        fi
-    fi
-
-    return 1
 }
 
 generate_concat_list() {
@@ -327,19 +316,72 @@ generate_concat_list() {
     local media_list="$WORK_DIR/media_list.txt"
     local encoder=$(detect_gpu_encoder)
     local idx=0
+    local video_idx=0
     local is_video=""
     local media=""
+    local use_media=""
     local parallel_count=0
     local pids=()
-    local temp_results="$WORK_DIR/temp_results.txt"
+    local completed_count=0
+    local video_count=0
+    local last=""
 
     log "エンコーダー: $encoder (解像度:${TARGET_RESOLUTION}, CRF:${ENCODE_CRF}, FPS:${ENCODE_FPS}, 並列:${MAX_PARALLEL})"
 
     : >"$LIST_FILE"
-    : >"$temp_results"
 
     collect_media "$dir" > "$media_list"
+    local total_count=$(wc -l < "$media_list")
 
+    # まず動画の数をカウント
+    video_count=$(grep -iE '\.(mp4|mov|avi|mkv|webm)$' "$media_list" | wc -l)
+
+    if [ "$video_count" -gt 0 ]; then
+        log "動画を変換中: ${video_count}件"
+    fi
+
+    # 動画のみ並列で事前変換
+    while IFS= read -r media <&3; do
+        case "$media" in
+            *.mp4|*.MP4|*.mov|*.MOV|*.avi|*.AVI|*.mkv|*.MKV|*.webm|*.WEBM)
+                video_idx=$((video_idx + 1))
+                (
+                    result=$(convert_video_to_clip "$video_idx" "$media" "$encoder")
+                    if [ -n "$result" ]; then
+                        echo "$video_idx|$result" > "$WORK_DIR/video_result_${video_idx}.txt"
+                    fi
+                ) &
+
+                pids+=($!)
+                parallel_count=$((parallel_count + 1))
+
+                # 並列数制限
+                if [ "$parallel_count" -ge "$MAX_PARALLEL" ]; then
+                    wait "${pids[@]}"
+                    pids=()
+                    parallel_count=0
+                fi
+                ;;
+        esac
+    done 3< "$media_list"
+
+    # 残りの動画変換を待機
+    if [ ${#pids[@]} -gt 0 ]; then
+        wait "${pids[@]}"
+    fi
+
+    # 変換済み動画をマップに格納（連想配列）
+    declare -A video_map
+    for result_file in "$WORK_DIR"/video_result_*.txt; do
+        [ -f "$result_file" ] || continue
+        while IFS='|' read -r v_idx converted_path; do
+            video_map[$v_idx]="$converted_path"
+        done < "$result_file"
+    done
+
+    # concatリスト生成: 画像はそのまま、動画は変換済みパスを使用
+    idx=0
+    video_idx=0
     while IFS= read -r media <&3; do
         idx=$((idx + 1))
         is_video=false
@@ -347,37 +389,36 @@ generate_concat_list() {
         case "$media" in
             *.mp4|*.MP4|*.mov|*.MOV|*.avi|*.AVI|*.mkv|*.MKV|*.webm|*.WEBM)
                 is_video=true
+                video_idx=$((video_idx + 1))
                 ;;
         esac
 
-        # 並列実行
-        (
-            result=$(convert_media_to_clip "$idx" "$media" "$is_video" "$encoder")
-            if [ -n "$result" ]; then
-                echo "$idx|$result"
-            fi
-        ) >> "$temp_results" &
-
-        pids+=($!)
-        parallel_count=$((parallel_count + 1))
-
-        # 並列数制限
-        if [ "$parallel_count" -ge "$MAX_PARALLEL" ]; then
-            wait "${pids[@]}"
-            pids=()
-            parallel_count=0
+        if [ "$is_video" = "true" ]; then
+            # 変換済み動画を使用
+            use_media="${video_map[$video_idx]}"
+            [ -z "$use_media" ] && continue
+            # 動画の実際の長さを取得
+            local video_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "1")
+            printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
+            printf "duration %s\n" "$video_duration" >>"$LIST_FILE"
+        else
+            # 画像はそのまま使用（HEIF/HEICのみ変換）
+            use_media=$(process_image "$media")
+            [ -z "$use_media" ] && continue
+            printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
+            printf "duration %s\n" "$IMAGE_DURATION" >>"$LIST_FILE"
         fi
+
+        last="$use_media"
     done 3< "$media_list"
 
-    # 残りの処理を待機
-    [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}"
+    # concat demuxer needs the last file repeated ONLY if it's not a video
+    # (videos have their own duration, images need the duration directive)
+    if [ -n "$last" ] && [ "$is_video" != "true" ]; then
+        printf "file '%s'\n" "$last" >>"$LIST_FILE"
+    fi
 
-    # 結果をインデックス順にソートしてリストに追加
-    sort -t'|' -k1 -n "$temp_results" | while IFS='|' read -r idx_result clip_path; do
-        [ -n "$clip_path" ] && printf "file '%s'\n" "$clip_path" >>"$LIST_FILE"
-    done
-
-    rm -f "$temp_results"
+    rm -f "$WORK_DIR"/video_result_*.txt
 }
 
 build_video() {
@@ -404,13 +445,18 @@ build_video() {
     # -hide_banner        suppress startup banner
     # -loglevel error     show errors (but exit code determines success)
     # -f concat -safe 0   use concat list (allows absolute paths)
-    # -i LIST_FILE        pre-converted video clips list
-    # -c copy             すべてのクリップが同じフォーマットなので再エンコード不要（高速）
+    # -i LIST_FILE        画像と変換済み動画の混在リスト
+    # -vf ...             画像のみ正規化（動画は既に変換済み）
+    # -vsync vfr          可変フレームレート（画像は1フレーム、動画は元のまま）
+    # -c:v libx264        エンコード
     # -movflags +faststart place metadata at file head
     # エラー出力は記録するが、終了コードで成否を判定
     ffmpeg_output=$(ffmpeg -y -hide_banner -loglevel error \
         -f concat -safe 0 -i "$LIST_FILE" \
-        -c copy -movflags +faststart \
+        -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+        -vsync vfr \
+        -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" -movflags +faststart \
+        -an \
         "$tmp_video" 2>&1)
     ffmpeg_exit=$?
 
@@ -586,7 +632,7 @@ if ! flock -n 200; then
 fi
 
 set -o errtrace
-trap 'rc=$?; cleanup_child; log "終了コード: $rc"' EXIT
+trap 'rc=$?; cleanup_child; rm -f "$LOCK_FILE"; log "終了コード: $rc"' EXIT
 trap 'log "ERR line=$LINENO cmd=${BASH_COMMAND} rc=$?"' ERR
 trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM

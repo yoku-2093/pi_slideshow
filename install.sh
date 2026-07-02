@@ -24,7 +24,10 @@ mkdir -p "$INSTALL_DIR" "$APP_DIR"
 # 行ズレで "command not found" や "syntax error" を引き起こす。
 if pgrep -f "$TARGET_SCRIPT" >/dev/null 2>&1; then
     echo "⚠ 稼働中のスライドショーを検出しました。"
-    echo "  反映には一度終了して再起動してください（pkill -f slideshow.sh）。"
+    echo "  反映には一度終了して再起動してください:"
+    echo "    pkill -f slideshow.sh"
+    echo "  ※プロセスが見つからない場合はロックファイルを削除:"
+    echo "    rm -f /tmp/pi_slideshow.*.lock"
 fi
 
 # 原子的置換でスクリプトを配置する。

@@ -10,6 +10,13 @@ if pgrep -f "slideshow.sh" >/dev/null 2>&1; then
     sleep 1
 fi
 
+# ロックファイルを削除（異常終了時に残ることがある）
+lock_files=(/tmp/pi_slideshow.*.lock)
+if [ -f "${lock_files[0]}" ]; then
+    rm -f /tmp/pi_slideshow.*.lock
+    echo "- ロックファイルを削除"
+fi
+
 # インストールディレクトリを削除
 INSTALL_DIR="$HOME/.local/share/pi_slideshow"
 if [ -d "$INSTALL_DIR" ]; then
