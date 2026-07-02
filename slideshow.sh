@@ -23,12 +23,18 @@ CHECK_INTERVAL=30
 # メインループの待機間隔（秒）。短くすると境界検知の取りこぼしが減る。
 POLL_INTERVAL=0.2
 # 出力動画の解像度（幅:高さ）。画像は比率維持で余白付き配置される。
-# 1280:720 は 1920:1080 よりエンコード負荷が軽く、生成が速い。
-TARGET_RESOLUTION="1280:720"
+# 低解像度ほどエンコードが高速: 960:540=30-40%高速, 854:480=50-60%高速
+TARGET_RESOLUTION="${SLIDESHOW_RESOLUTION:-1280:720}"
 # エンコード速度優先設定。Raspberry Pi では ultrafast 推奨。
 ENCODE_PRESET="ultrafast"
-# 画質と容量のバランス。値を上げるほど軽量/低画質。
-ENCODE_CRF=28
+# 画質と容量のバランス。値を上げるほど軽量/低画質/高速。
+ENCODE_CRF="${SLIDESHOW_CRF:-30}"
+# フレームレート。静止画スライドショーでは低くても問題なし。
+ENCODE_FPS="${SLIDESHOW_FPS:-15}"
+# クリップ生成の並列数。CPUコア数に応じて調整。
+MAX_PARALLEL="${SLIDESHOW_PARALLEL:-4}"
+# GPUエンコーダーを使用するか (auto/yes/no)
+USE_GPU_ENCODER="${SLIDESHOW_GPU:-auto}"
 # ループ境界を判定する余白（秒）。
 # 直前のtime-posが終端側この範囲内、かつ現在のtime-posが先頭側この範囲内なら
 # 「1ループ終了して先頭に戻った」と判定する。
@@ -43,6 +49,46 @@ log() {
     # Output: timestamped line to stdout/log
     # Return: 0
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+detect_gpu_encoder() {
+    # Input: none
+    # Output: encoder name (h264_v4l2m2m, h264_omx, or libx264)
+    # Return: 0
+    if [ "$USE_GPU_ENCODER" = "no" ]; then
+        echo "libx264"
+        return 0
+    fi
+
+    # h264_v4l2m2m を優先 (Raspberry Pi 4/5で安定)
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_v4l2m2m"; then
+        # 実際にテストエンコードして動作確認
+        if ffmpeg -y -f lavfi -i color=black:s=64x64:d=0.1 -c:v h264_v4l2m2m -f null - >/dev/null 2>&1; then
+            echo "h264_v4l2m2m"
+            return 0
+        fi
+    fi
+
+    # h264_omx を次に試す (古いRaspberry Pi)
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_omx"; then
+        if ffmpeg -y -f lavfi -i color=black:s=64x64:d=0.1 -c:v h264_omx -f null - >/dev/null 2>&1; then
+            echo "h264_omx"
+            return 0
+        fi
+    fi
+
+    # フォールバック: ソフトウェアエンコーダー
+    echo "libx264"
+}
+
+get_media_cache_key() {
+    # Input: $1 (media file path)
+    # Output: cache key (mtime-size-resolution-crf-fps)
+    # Return: 0
+    local f="$1"
+    local mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+    local size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+    echo "${mtime}-${size}-${TARGET_RESOLUTION}-${ENCODE_CRF}-${ENCODE_FPS}"
 }
 
 show_error() {
@@ -180,118 +226,158 @@ apply_rotation() {
     fi
 }
 
+convert_media_to_clip() {
+    # Input: $1=index $2=media_path $3=is_video $4=encoder
+    # Output: writes clip file
+    # Return: 0 success, 1 failure
+    local idx="$1"
+    local media="$2"
+    local is_video="$3"
+    local encoder="$4"
+    local use_media="$media"
+    local converted_clip="$WORK_DIR/clip_$(printf '%03d' $idx).mp4"
+    local cache_key=$(get_media_cache_key "$media")
+    local cache_meta="$WORK_DIR/clip_$(printf '%03d' $idx).meta"
+    local tmp_jpg=""
+    local tmp_raw=""
+    local duration=""
+    local encoder_opts=""
+
+    # キャッシュチェック: metaファイルとクリップが存在し、cache_keyが一致すればスキップ
+    if [ -f "$cache_meta" ] && [ -f "$converted_clip" ]; then
+        if [ "$(cat "$cache_meta" 2>/dev/null)" = "$cache_key" ]; then
+            echo "$converted_clip"
+            return 0
+        fi
+    fi
+
+    # HEIF/HEIC を JPG に変換
+    case "$media" in
+        *.heif|*.HEIF|*.heic|*.HEIC)
+            tmp_jpg="$WORK_DIR/temp_$(basename "${media%.*}").jpg"
+            tmp_raw="$WORK_DIR/temp_raw_$(basename "${media%.*}").jpg"
+
+            if command -v heif-convert >/dev/null 2>&1; then
+                if heif-convert "$media" "$tmp_raw" >/dev/null 2>&1; then
+                    if check_needs_rotation "$tmp_raw"; then
+                        if apply_rotation "$tmp_raw" "$tmp_jpg"; then
+                            use_media="$tmp_jpg"
+                            rm -f "$tmp_raw"
+                        else
+                            mv -f "$tmp_raw" "$tmp_jpg"
+                            use_media="$tmp_jpg"
+                        fi
+                    else
+                        mv -f "$tmp_raw" "$tmp_jpg"
+                        use_media="$tmp_jpg"
+                    fi
+                else
+                    return 1
+                fi
+            else
+                return 1
+            fi
+            ;;
+    esac
+
+    # エンコーダー別オプション
+    if [ "$encoder" = "h264_v4l2m2m" ] || [ "$encoder" = "h264_omx" ]; then
+        # GPU: presetとcrfは使えない
+        encoder_opts="-c:v $encoder -b:v 2M"
+    else
+        # CPU: libx264
+        encoder_opts="-c:v libx264 -preset $ENCODE_PRESET -crf $ENCODE_CRF"
+    fi
+
+    if [ "$is_video" = "true" ]; then
+        # 動画変換
+        duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "$IMAGE_DURATION")
+
+        if ffmpeg -y -hide_banner -loglevel error -i "$use_media" \
+            -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+            -r "$ENCODE_FPS" $encoder_opts \
+            -an -movflags +faststart \
+            "$converted_clip" 2>/dev/null; then
+            echo "$cache_key" > "$cache_meta"
+            echo "$converted_clip"
+            return 0
+        fi
+    else
+        # 画像変換
+        if ffmpeg -y -hide_banner -loglevel error \
+            -loop 1 -i "$use_media" -t "$IMAGE_DURATION" \
+            -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+            -r "$ENCODE_FPS" $encoder_opts \
+            -movflags +faststart \
+            "$converted_clip" 2>/dev/null; then
+            echo "$cache_key" > "$cache_meta"
+            echo "$converted_clip"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 generate_concat_list() {
     # Input: $1 (media directory)
     # Output: LIST_FILE for ffmpeg concat demuxer
     # Return: 0
     local dir="$1"
-    local use_media=""
-    local duration=""
-    local is_video=""
-    local tmp_jpg=""
-    local tmp_raw=""
     local media_list="$WORK_DIR/media_list.txt"
-    local converted_clip=""
+    local encoder=$(detect_gpu_encoder)
     local idx=0
+    local is_video=""
+    local media=""
+    local parallel_count=0
+    local pids=()
+    local temp_results="$WORK_DIR/temp_results.txt"
+
+    log "エンコーダー: $encoder (解像度:${TARGET_RESOLUTION}, CRF:${ENCODE_CRF}, FPS:${ENCODE_FPS}, 並列:${MAX_PARALLEL})"
 
     : >"$LIST_FILE"
+    : >"$temp_results"
 
-    # collect_media の出力を一旦ファイルに保存
     collect_media "$dir" > "$media_list"
-
-    # デバッグ用ファイル
-    local debug_file="$WORK_DIR/debug.log"
-    : > "$debug_file"
 
     while IFS= read -r media <&3; do
         idx=$((idx + 1))
-        # デバッグ: 読み込んだ値を記録
-        echo "READ #${idx}: [$media]" >> "$debug_file"
-
-        use_media="$media"
-        duration="$IMAGE_DURATION"
         is_video=false
 
-        # 動画ファイルかどうかを判定
         case "$media" in
             *.mp4|*.MP4|*.mov|*.MOV|*.avi|*.AVI|*.mkv|*.MKV|*.webm|*.WEBM)
                 is_video=true
                 ;;
         esac
 
-        # HEIF/HEIC を JPG に変換して回転補正
-        case "$media" in
-            *.heif|*.HEIF|*.heic|*.HEIC)
-                tmp_jpg="$WORK_DIR/temp_$(basename "${media%.*}").jpg"
-                tmp_raw="$WORK_DIR/temp_raw_$(basename "${media%.*}").jpg"
-
-                # heif-convert で JPG に変換
-                if command -v heif-convert >/dev/null 2>&1; then
-                    if heif-convert "$media" "$tmp_raw" >/dev/null 2>&1; then
-                        # 回転が必要かチェック
-                        if check_needs_rotation "$tmp_raw"; then
-                            # ffmpeg で回転処理
-                            if apply_rotation "$tmp_raw" "$tmp_jpg"; then
-                                use_media="$tmp_jpg"
-                                rm -f "$tmp_raw"
-                            else
-                                # 回転失敗時は変換後のファイルをそのまま使用
-                                mv -f "$tmp_raw" "$tmp_jpg"
-                                use_media="$tmp_jpg"
-                            fi
-                        else
-                            # 回転不要の場合
-                            mv -f "$tmp_raw" "$tmp_jpg"
-                            use_media="$tmp_jpg"
-                        fi
-                    else
-                        log "WARN: HEIF 変換失敗: $media"
-                        continue
-                    fi
-                else
-                    log "WARN: heif-convert コマンドが見つかりません"
-                    continue
-                fi
-                ;;
-        esac
-
-        # すべてのメディア（画像と動画）を統一フォーマットの動画クリップに変換
-        # これにより concat demuxer で画像と動画の混在時の問題を回避
-        converted_clip="$WORK_DIR/clip_$(printf '%03d' $idx).mp4"
-
-        if [ "$is_video" = true ]; then
-            # 動画の場合: 元の長さを保持しつつ、解像度とフォーマットを統一
-            duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "$IMAGE_DURATION")
-            duration=$(printf "%.2f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
-
-            if ffmpeg -y -hide_banner -loglevel error -i "$use_media" \
-                -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
-                -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" \
-                -an -movflags +faststart \
-                "$converted_clip" 2>/dev/null; then
-                echo "CONVERT VIDEO #${idx}: [$use_media] -> [$converted_clip] duration=${duration}s" >> "$debug_file"
-            else
-                log "WARN: 動画変換失敗: $media"
-                continue
+        # 並列実行
+        (
+            result=$(convert_media_to_clip "$idx" "$media" "$is_video" "$encoder")
+            if [ -n "$result" ]; then
+                echo "$idx|$result"
             fi
-        else
-            # 画像の場合: IMAGE_DURATION 秒の動画クリップに変換
-            if ffmpeg -y -hide_banner -loglevel error \
-                -loop 1 -i "$use_media" -t "$IMAGE_DURATION" \
-                -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
-                -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" \
-                -movflags +faststart \
-                "$converted_clip" 2>/dev/null; then
-                echo "CONVERT IMAGE #${idx}: [$use_media] -> [$converted_clip] duration=${IMAGE_DURATION}s" >> "$debug_file"
-            else
-                log "WARN: 画像変換失敗: $media"
-                continue
-            fi
+        ) >> "$temp_results" &
+
+        pids+=($!)
+        parallel_count=$((parallel_count + 1))
+
+        # 並列数制限
+        if [ "$parallel_count" -ge "$MAX_PARALLEL" ]; then
+            wait "${pids[@]}"
+            pids=()
+            parallel_count=0
         fi
-
-        # 変換後の動画クリップをリストに追加（durationディレクティブは不要）
-        printf "file '%s'\n" "$converted_clip" >>"$LIST_FILE"
     done 3< "$media_list"
+
+    # 残りの処理を待機
+    [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}"
+
+    # 結果をインデックス順にソートしてリストに追加
+    sort -t'|' -k1 -n "$temp_results" | while IFS='|' read -r idx_result clip_path; do
+        [ -n "$clip_path" ] && printf "file '%s'\n" "$clip_path" >>"$LIST_FILE"
+    done
+
+    rm -f "$temp_results"
 }
 
 build_video() {
