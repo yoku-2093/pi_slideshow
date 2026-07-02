@@ -123,9 +123,10 @@ collect_media() {
     # Output: sorted media paths (images and videos), one per line, newest first
     # Return: 0
     local dir="$1"
+    # stat で更新日時を取得し、sort -rn で新しい順にソート
     find "$dir" -maxdepth 1 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' -o -iname '*.heif' -o -iname '*.heic' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' -o -iname '*.webm' \) \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+        -exec stat -c '%Y %n' {} \; 2>/dev/null | sort -rn | cut -d' ' -f2-
 }
 
 media_signature() {
@@ -190,10 +191,21 @@ generate_concat_list() {
     local is_video=""
     local tmp_jpg=""
     local tmp_raw=""
+    local media_list="$WORK_DIR/media_list.txt"
 
     : >"$LIST_FILE"
 
-    while IFS= read -r media; do
+    # collect_media の出力を一旦ファイルに保存
+    collect_media "$dir" > "$media_list"
+
+    # デバッグ用ファイル
+    local debug_file="$WORK_DIR/debug.log"
+    : > "$debug_file"
+
+    while IFS= read -r media <&3; do
+        # デバッグ: 読み込んだ値を記録
+        echo "READ: [$media]" >> "$debug_file"
+
         use_media="$media"
         duration="$IMAGE_DURATION"
         is_video=false
@@ -213,7 +225,8 @@ generate_concat_list() {
 
                 # まず heif-convert で JPG に変換（EXIF は保持される）
                 if command -v heif-convert >/dev/null 2>&1; then
-                    if heif-convert "$media" "$tmp_raw" 2>&1 | grep -q "Written to"; then
+                    heif_output=$(heif-convert "$media" "$tmp_raw" 2>&1)
+                    if echo "$heif_output" | grep -q "Written to"; then
                         : # 変換成功
                     else
                         log "WARN: HEIF 変換失敗: $media"
@@ -249,10 +262,14 @@ generate_concat_list() {
             duration=$(printf "%.0f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
         fi
 
-        printf "file '%s'\n" "${use_media//\'/'\\'''}" >>"$LIST_FILE"
+        # デバッグ: 書き込み前の値を記録
+        echo "WRITE: [$use_media]" >> "$debug_file"
+
+        # シングルクォートで囲む（シングルクォートを含むパス名は使われない前提）
+        printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
         printf "duration %s\n" "$duration" >>"$LIST_FILE"
         last="$use_media"
-    done < <(collect_media "$dir")
+    done 3< "$media_list"
 
     # concat demuxer needs the last file repeated so its duration applies.
     if [ -n "$last" ]; then
