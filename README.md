@@ -1,13 +1,13 @@
 # pi_slideshow
 
-Raspberry Pi の画像フォルダを、GUI 上で安定表示するスライドショーツールです。
+Raspberry Pi の画像・動画フォルダを、GUI 上で安定表示するスライドショーツールです。
 
-画像をそのまま順送りするのではなく、`ffmpeg` で 1 本の動画にまとめてから再生します。
-これにより、画像サイズ差による切替ムラを減らしています。
+画像や動画をそのまま順送りするのではなく、`ffmpeg` で 1 本の動画にまとめてから再生します。
+これにより、ファイルサイズ差による切替ムラを減らしています。
 
 ## 仕組み
 
-1. 画像フォルダから concat リストを生成
+1. 画像・動画フォルダから concat リストを生成
 2. `ffmpeg` でスライドショー動画（`slideshow_a.mp4` / `slideshow_b.mp4`）を作成
 3. `mpv` で動画を無限ループ再生
 4. フォルダ変更時は裏で新動画を再生成（`pending_video`）
@@ -19,12 +19,12 @@ Raspberry Pi の画像フォルダを、GUI 上で安定表示するスライド
 ## 特徴
 
 - GUI 専用（TTY 切替なし）
-- 1枚あたり表示時間は `IMAGE_DURATION` で制御
-- 画像追加・削除・更新を定期監視して反映
+- 画像は 1枚あたり表示時間を `IMAGE_DURATION` で制御、動画は元の長さで再生
+- 画像・動画の追加・削除・更新を定期監視して反映
 - ループ境界での遅延切替（`pending_video`）＋ `mpv` IPC によるシームレス切替
 - VFR（可変フレームレート）+ 720p 生成で Raspberry Pi でも高速にエンコード
-- HEIF/HEIC の EXIF 回転（向き）を自動補正
-- 初期動画生成中は `yad` で待機ダイアログを表示
+- JPG/JPEG/HEIF/HEIC の EXIF 回転（向き）を自動補正
+- 動画生成中は `yad` で待機ダイアログを表示
 - ログを `~/.local/state/pi_slideshow/slideshow.log` に保存
 
 ## 必要パッケージ
@@ -36,17 +36,17 @@ sudo apt install -y ffmpeg mpv zenity python3 yad
 
 ### 任意（推奨）
 
-- `libheif-examples`（`heif-convert`）: HEIF/HEIC の確実なデコードに使用
-  （無い場合は `ffmpeg` にフォールバックしますが、環境により失敗することがあります）
-- `python3-pil`（PIL/Pillow）: HEIF/HEIC 由来画像の向き（EXIF Orientation）補正に使用
+- `python3-pil`（PIL/Pillow）: JPG/JPEG の向き（EXIF Orientation）補正に使用
 
 ```bash
-sudo apt install -y libheif-examples python3-pil
+sudo apt install -y python3-pil
 ```
 
-## 対応画像形式
+## 対応形式
 
-以下の形式に対応しています：
+### 画像形式
+
+以下の画像形式に対応しています：
 
 - JPG / JPEG
 - PNG
@@ -57,12 +57,27 @@ sudo apt install -y libheif-examples python3-pil
 
 HEIF / HEIC 形式（iPhone や Google Photos で使われることがあります）は、
 動画生成時に自動で一時 JPG へ変換してから使用します。
+変換時に `ffmpeg` の `-autorotate 1` オプションで回転情報を実ピクセルへ適用するため、
+正しい向きで表示されます。
 元のフォルダ内のファイルは変更しません（変換ファイルは作業ディレクトリに作成されます）。
 
-また、HEIF/HEIC は撮影時の向きを EXIF Orientation タグで持つことがあります。
-`ffmpeg` はこのタグを無視するため、そのままでは横倒しで表示されてしまいます。
-本ツールは変換後に PIL（Pillow）で回転を実ピクセルへ焼き込み、常に正しい向きで表示します。
+また、JPG/JPEG も撮影時の向きを EXIF Orientation タグで持つことがあります。
+`ffmpeg` の concat demuxer はこのタグを無視するため、そのままでは横倒しで表示されてしまいます。
+本ツールは PIL（Pillow）で回転を実ピクセルへ焼き込み、常に正しい向きで表示します。
 （PIL が無い環境では向き補正をスキップします）
+
+### 動画形式
+
+以下の動画形式に対応しています：
+
+- MP4
+- MOV
+- AVI
+- MKV
+- WebM
+
+動画ファイルは元の長さ（秒数）のままスライドショーに含まれます。
+画像のように固定秒数ではなく、動画の実際の再生時間が使用されます。
 
 ## インストール
 

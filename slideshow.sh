@@ -25,9 +25,6 @@ POLL_INTERVAL=0.2
 # 出力動画の解像度（幅:高さ）。画像は比率維持で余白付き配置される。
 # 1280:720 は 1920:1080 よりエンコード負荷が軽く、生成が速い。
 TARGET_RESOLUTION="1280:720"
-# 生成動画の最大フレームレート。VFR(可変フレームレート)生成時の上限として使う。
-# 静止画スライドは画像切替時のみフレームを持てば十分なので低めでよい。
-VIDEO_FPS=1
 # エンコード速度優先設定。Raspberry Pi では ultrafast 推奨。
 ENCODE_PRESET="ultrafast"
 # 画質と容量のバランス。値を上げるほど軽量/低画質。
@@ -85,7 +82,7 @@ show_busy_start() {
         # 前回異常終了時の取り残しダイアログを先に掃除する。
         pkill -f "yad --title=スライドショー" 2>/dev/null || true
         yad --title="スライドショー" \
-            --text="\n\n\n初期動画を生成中です...\n" \
+            --text="\n\n\n動画を生成中です...\n" \
             --text-align=center \
             --no-buttons --on-top --center --fixed --geometry=320x90 \
             --undecorated --skip-taskbar --no-wrap 2>/dev/null &
@@ -93,7 +90,7 @@ show_busy_start() {
         return 0
     fi
 
-    log "【生成中】初期動画を生成しています..."
+    log "【生成中】動画を生成しています..."
 }
 
 show_busy_end() {
@@ -121,87 +118,141 @@ handle_signal() {
     exit 0
 }
 
-collect_images() {
-    # Input: $1 (image directory)
-    # Output: sorted image paths, one per line
+collect_media() {
+    # Input: $1 (media directory)
+    # Output: sorted media paths (images and videos), one per line, newest first
     # Return: 0
     local dir="$1"
     find "$dir" -maxdepth 1 -type f \
-        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' -o -iname '*.heif' -o -iname '*.heic' \) \
-        -print 2>/dev/null | sort
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' -o -iname '*.heif' -o -iname '*.heic' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' -o -iname '*.webm' \) \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
 }
 
-image_signature() {
-    # Input: $1 (image directory)
+media_signature() {
+    # Input: $1 (media directory)
     # Output: SHA256 signature string
     # Return: 0
     local dir="$1"
-    collect_images "$dir" | while IFS= read -r f; do
+    collect_media "$dir" | while IFS= read -r f; do
         printf '%s\t%s\t%s\n' "$f" "$(stat -c '%s' "$f" 2>/dev/null || echo 0)" "$(stat -c '%Y' "$f" 2>/dev/null || echo 0)"
     done | sha256sum | awk '{print $1}'
 }
 
-auto_orient_inplace() {
+check_needs_rotation() {
     # Input: $1 (jpg file path)
-    # Output: none (rewrites file with EXIF rotation baked into pixels)
-    # Return: 0
-    # HEIF/iPhone 由来の JPG は EXIF Orientation(例:6=90度回転)を持つが、
-    # ffmpeg の concat demuxer はこのタグを無視して横倒しのまま再生してしまう。
-    # ここで PIL を使い回転を実ピクセルへ適用しタグを除去することで、
-    # 再生エンジンに依存せず常に正しい向きで表示させる。
+    # Output: none
+    # Return: 0 if rotation needed, 1 otherwise
     local f="$1"
-    python3 - "$f" <<'PY' 2>/dev/null || true
+    python3 - "$f" <<'PY' 2>/dev/null
 import sys
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image
 except Exception:
-    sys.exit(0)  # PIL が無ければ何もしない（向き補正をスキップ）
+    sys.exit(1)  # PIL が無ければ回転不要扱い
+
 p = sys.argv[1]
 try:
     im = Image.open(p)
     exif = im.getexif()
     orient = exif.get(0x0112) if exif else None
-    if orient in (None, 0, 1):
-        sys.exit(0)  # 回転不要
-    fixed = ImageOps.exif_transpose(im)  # EXIF回転を実ピクセルへ適用
-    fixed.save(p, quality=92)
+    if orient and orient not in (0, 1):
+        sys.exit(0)  # 回転必要
+    sys.exit(1)  # 回転不要
 except Exception:
-    sys.exit(0)
+    sys.exit(1)
 PY
 }
 
+apply_rotation() {
+    # Input: $1 (source jpg file path), $2 (destination jpg file path)
+    # Output: none (creates destination with EXIF rotation baked into pixels)
+    # Return: 0 if success, 1 if failed
+    local src="$1"
+    local dst="$2"
+
+    # PIL での回転処理の代わりに、ffmpeg -autorotate を使用
+    # これにより concat demuxer との互換性問題を回避
+    if ffmpeg -y -hide_banner -loglevel fatal -autorotate 1 -i "$src" -q:v 2 "$dst" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 generate_concat_list() {
-    # Input: $1 (image directory)
+    # Input: $1 (media directory)
     # Output: LIST_FILE for ffmpeg concat demuxer
     # Return: 0
     local dir="$1"
     local last=""
+    local use_media=""
+    local duration=""
+    local is_video=""
+    local tmp_jpg=""
+    local tmp_raw=""
+
     : >"$LIST_FILE"
 
-    while IFS= read -r img; do
-        local use_img="$img"
-        # Convert HEIF/HEIC on-the-fly to temporary JPG if needed.
-        # heif-convert (libheif) を優先し、無ければ ffmpeg にフォールバックする。
-        case "$img" in
-            *.heif|*.HEIF|*.heic|*.HEIC)
-                local tmp_jpg="$WORK_DIR/temp_$(basename "${img%.*}").jpg"
-                if command -v heif-convert >/dev/null 2>&1 \
-                    && heif-convert "$img" "$tmp_jpg" >/dev/null 2>&1; then
-                    use_img="$tmp_jpg"
-                elif ffmpeg -y -hide_banner -loglevel error -i "$img" "$tmp_jpg" 2>/dev/null; then
-                    use_img="$tmp_jpg"
-                else
-                    log "WARN: HEIF 変換失敗: $img"
-                    continue
-                fi
-                # EXIF Orientation を実ピクセルへ焼き込み、横倒し再生を防ぐ。
-                auto_orient_inplace "$tmp_jpg"
+    while IFS= read -r media; do
+        use_media="$media"
+        duration="$IMAGE_DURATION"
+        is_video=false
+
+        # 動画ファイルかどうかを判定
+        case "$media" in
+            *.mp4|*.MP4|*.mov|*.MOV|*.avi|*.AVI|*.mkv|*.MKV|*.webm|*.WEBM)
+                is_video=true
                 ;;
         esac
-        printf "file '%s'\n" "${use_img//\'/'\\'''}" >>"$LIST_FILE"
-        printf "duration %s\n" "$IMAGE_DURATION" >>"$LIST_FILE"
-        last="$use_img"
-    done < <(collect_images "$dir")
+
+        # HEIF/HEIC は一時 JPG に変換して回転補正
+        case "$media" in
+            *.heif|*.HEIF|*.heic|*.HEIC)
+                tmp_jpg="$WORK_DIR/temp_$(basename "${media%.*}").jpg"
+                tmp_raw="$WORK_DIR/temp_raw_$(basename "${media%.*}").jpg"
+
+                # まず heif-convert で JPG に変換（EXIF は保持される）
+                if command -v heif-convert >/dev/null 2>&1; then
+                    if heif-convert "$media" "$tmp_raw" 2>&1 | grep -q "Written to"; then
+                        : # 変換成功
+                    else
+                        log "WARN: HEIF 変換失敗: $media"
+                        continue
+                    fi
+
+                    # 変換後、回転が必要かチェックして適用
+                    if check_needs_rotation "$tmp_raw"; then
+                        if apply_rotation "$tmp_raw" "$tmp_jpg"; then
+                            use_media="$tmp_jpg"
+                            rm -f "$tmp_raw"
+                        else
+                            # 回転失敗時は変換後のファイルをそのまま使用
+                            mv -f "$tmp_raw" "$tmp_jpg"
+                            use_media="$tmp_jpg"
+                        fi
+                    else
+                        # 回転不要の場合
+                        mv -f "$tmp_raw" "$tmp_jpg"
+                        use_media="$tmp_jpg"
+                    fi
+                else
+                    log "WARN: heif-convert コマンドが見つかりません"
+                    continue
+                fi
+                ;;
+        esac
+
+        # 動画の場合はその動画の長さを取得
+        if [ "$is_video" = true ]; then
+            duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "$IMAGE_DURATION")
+            # 整数に丸める
+            duration=$(printf "%.0f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
+        fi
+
+        printf "file '%s'\n" "${use_media//\'/'\\'''}" >>"$LIST_FILE"
+        printf "duration %s\n" "$duration" >>"$LIST_FILE"
+        last="$use_media"
+    done < <(collect_media "$dir")
 
     # concat demuxer needs the last file repeated so its duration applies.
     if [ -n "$last" ]; then
@@ -210,13 +261,13 @@ generate_concat_list() {
 }
 
 build_video() {
-    # Input: $1 (image directory), $2 (output video file path)
+    # Input: $1 (media directory), $2 (output video file path)
     # Output: writes output video atomically
     # Return: 0 success, 1 failure
     local dir="$1"
     local out_file="$2"
     local tmp_video="$WORK_DIR/$(basename "$out_file").tmp.mp4"
-    local image_count=""
+    local media_count=""
     local est_seconds=""
 
     generate_concat_list "$dir"
@@ -224,14 +275,14 @@ build_video() {
         return 1
     fi
 
-    image_count="$(collect_images "$dir" | wc -l)"
-    est_seconds=$(( image_count * IMAGE_DURATION ))
+    media_count="$(collect_media "$dir" | wc -l)"
+    est_seconds=$(( media_count * IMAGE_DURATION ))
 
-    log "動画を再生成します: $(basename "$out_file") (images=${image_count}, est=${est_seconds}s)"
+    log "動画を再生成します: $(basename "$out_file") (media=${media_count}, est=${est_seconds}s)"
     # ffmpeg key options:
     # -y                  overwrite output
     # -hide_banner        suppress startup banner
-    # -loglevel error     show errors only
+    # -loglevel error     show errors (but exit code determines success)
     # -f concat -safe 0   use concat list (allows absolute paths)
     # -i LIST_FILE        image list with per-image duration
     # -vf ...             normalize frame size/format for stable playback
@@ -242,12 +293,25 @@ build_video() {
     # -preset ultrafast   prioritize encode speed on low-power devices
     # -crf 28             quality/size balance (higher = smaller/faster)
     # -movflags +faststart place metadata at file head
-    if ! ffmpeg -y -hide_banner -loglevel error \
+    # エラー出力は記録するが、終了コードで成否を判定
+    ffmpeg_output=$(ffmpeg -y -hide_banner -loglevel error \
         -f concat -safe 0 -i "$LIST_FILE" \
         -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
         -vsync vfr \
         -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" -movflags +faststart \
-        "$tmp_video"; then
+        "$tmp_video" 2>&1)
+    ffmpeg_exit=$?
+
+    if [ $ffmpeg_exit -ne 0 ]; then
+        log "ERROR: ffmpeg failed with exit code $ffmpeg_exit"
+        [ -n "$ffmpeg_output" ] && log "ffmpeg output: $ffmpeg_output"
+        rm -f "$tmp_video"
+        return 1
+    fi
+
+    # 動画が正常に生成されたか確認
+    if [ ! -s "$tmp_video" ]; then
+        log "WARN: 生成された動画ファイルが空です"
         rm -f "$tmp_video"
         return 1
     fi
@@ -453,10 +517,10 @@ log "画像表示秒数: $IMAGE_DURATION"
 
 show_busy_start
 
-sig="$(image_signature "$IMAGE_DIR")"
+sig="$(media_signature "$IMAGE_DIR")"
 if ! build_video "$IMAGE_DIR" "$VIDEO_A"; then
     show_busy_end
-    show_error "初期動画生成に失敗しました。画像ファイル形式を確認してください。"
+    show_error "動画生成に失敗しました。メディアファイル形式を確認してください。"
     exit 1
 fi
 
@@ -486,7 +550,7 @@ while true; do
     fi
 
     if [ "$now" -ge "$next_sig_check" ]; then
-        sig="$(image_signature "$IMAGE_DIR")"
+        sig="$(media_signature "$IMAGE_DIR")"
         # 現在の再生中(prev_sig)とも、生成済みの保留動画(PENDING_SIG)とも異なる
         # 場合のみ再生成する。これにより同じ内容を毎回作り直す無駄を防ぐ。
         if [ "$sig" != "$prev_sig" ] && [ "$sig" != "$PENDING_SIG" ]; then
