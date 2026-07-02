@@ -192,6 +192,7 @@ generate_concat_list() {
     local tmp_jpg=""
     local tmp_raw=""
     local media_list="$WORK_DIR/media_list.txt"
+    local converted_video=""
 
     : >"$LIST_FILE"
 
@@ -253,15 +254,32 @@ generate_concat_list() {
                 ;;
         esac
 
-        # 動画の場合はその動画の長さを取得
+        # 動画の場合は静止画像フォーマットに変換する必要がある
+        # concat demuxer で画像と動画を混在させるとタイミング問題が起きるため、
+        # 動画を画像シーケンスに変換してから結合する
         if [ "$is_video" = true ]; then
+            converted_video="$WORK_DIR/converted_$(basename "${media%.*}").mp4"
+
+            # 動画の長さを取得
             duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$use_media" 2>/dev/null || echo "$IMAGE_DURATION")
-            # 整数に丸める
-            duration=$(printf "%.0f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
+
+            # 動画を指定解像度にリサイズし、音声を削除
+            if ffmpeg -y -hide_banner -loglevel error -i "$use_media" \
+                -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+                -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" \
+                -an -movflags +faststart \
+                "$converted_video" 2>/dev/null; then
+                use_media="$converted_video"
+                # 整数に丸める
+                duration=$(printf "%.0f" "$duration" 2>/dev/null || echo "$IMAGE_DURATION")
+            else
+                log "WARN: 動画変換失敗: $media"
+                continue
+            fi
         fi
 
         # デバッグ: 書き込み前の値を記録
-        echo "WRITE: [$use_media]" >> "$debug_file"
+        echo "WRITE: [$use_media] duration=$duration" >> "$debug_file"
 
         # シングルクォートで囲む（シングルクォートを含むパス名は使われない前提）
         printf "file '%s'\n" "$use_media" >>"$LIST_FILE"
