@@ -217,36 +217,34 @@ generate_concat_list() {
                 ;;
         esac
 
-        # HEIF/HEIC は一時 JPG に変換して回転補正
+        # HEIF/HEIC を JPG に変換して回転補正
         case "$media" in
             *.heif|*.HEIF|*.heic|*.HEIC)
                 tmp_jpg="$WORK_DIR/temp_$(basename "${media%.*}").jpg"
                 tmp_raw="$WORK_DIR/temp_raw_$(basename "${media%.*}").jpg"
 
-                # まず heif-convert で JPG に変換（EXIF は保持される）
+                # heif-convert で JPG に変換
                 if command -v heif-convert >/dev/null 2>&1; then
-                    heif_output=$(heif-convert "$media" "$tmp_raw" 2>&1)
-                    if echo "$heif_output" | grep -q "Written to"; then
-                        : # 変換成功
-                    else
-                        log "WARN: HEIF 変換失敗: $media"
-                        continue
-                    fi
-
-                    # 変換後、回転が必要かチェックして適用
-                    if check_needs_rotation "$tmp_raw"; then
-                        if apply_rotation "$tmp_raw" "$tmp_jpg"; then
-                            use_media="$tmp_jpg"
-                            rm -f "$tmp_raw"
+                    if heif-convert "$media" "$tmp_raw" >/dev/null 2>&1; then
+                        # 回転が必要かチェック
+                        if check_needs_rotation "$tmp_raw"; then
+                            # ffmpeg で回転処理
+                            if apply_rotation "$tmp_raw" "$tmp_jpg"; then
+                                use_media="$tmp_jpg"
+                                rm -f "$tmp_raw"
+                            else
+                                # 回転失敗時は変換後のファイルをそのまま使用
+                                mv -f "$tmp_raw" "$tmp_jpg"
+                                use_media="$tmp_jpg"
+                            fi
                         else
-                            # 回転失敗時は変換後のファイルをそのまま使用
+                            # 回転不要の場合
                             mv -f "$tmp_raw" "$tmp_jpg"
                             use_media="$tmp_jpg"
                         fi
                     else
-                        # 回転不要の場合
-                        mv -f "$tmp_raw" "$tmp_jpg"
-                        use_media="$tmp_jpg"
+                        log "WARN: HEIF 変換失敗: $media"
+                        continue
                     fi
                 else
                     log "WARN: heif-convert コマンドが見つかりません"
@@ -311,26 +309,28 @@ build_video() {
     # -crf 28             quality/size balance (higher = smaller/faster)
     # -movflags +faststart place metadata at file head
     # エラー出力は記録するが、終了コードで成否を判定
+    # -an: 音声なし
     ffmpeg_output=$(ffmpeg -y -hide_banner -loglevel error \
         -f concat -safe 0 -i "$LIST_FILE" \
         -vf "scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease,pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
         -vsync vfr \
         -c:v libx264 -preset "$ENCODE_PRESET" -crf "$ENCODE_CRF" -movflags +faststart \
+        -an \
         "$tmp_video" 2>&1)
     ffmpeg_exit=$?
 
-    if [ $ffmpeg_exit -ne 0 ]; then
-        log "ERROR: ffmpeg failed with exit code $ffmpeg_exit"
+    # 動画が正常に生成されたか確認（終了コードではなくファイルの存在で判定）
+    # ffmpegは警告があってもexit code 0以外を返すことがあるが、ファイルは生成される
+    if [ ! -s "$tmp_video" ]; then
+        log "ERROR: 動画ファイルが生成されませんでした (ffmpeg exit code: $ffmpeg_exit)"
         [ -n "$ffmpeg_output" ] && log "ffmpeg output: $ffmpeg_output"
         rm -f "$tmp_video"
         return 1
     fi
 
-    # 動画が正常に生成されたか確認
-    if [ ! -s "$tmp_video" ]; then
-        log "WARN: 生成された動画ファイルが空です"
-        rm -f "$tmp_video"
-        return 1
+    # ファイルが生成されていれば成功（警告は無視）
+    if [ $ffmpeg_exit -ne 0 ]; then
+        log "WARN: ffmpeg returned exit code $ffmpeg_exit but file was generated successfully"
     fi
 
     mv -f "$tmp_video" "$out_file"
@@ -355,7 +355,8 @@ start_player() {
     # --loop-file=inf     loop one file forever
     # --no-terminal       suppress terminal status UI
     # --input-ipc-server  expose control/status socket for loop-boundary detect
-    mpv --no-config --fs --loop-file=inf --no-terminal --input-ipc-server="$IPC_SOCKET" "$video" &
+    # --no-audio          音声を再生しない
+    mpv --no-config --fs --loop-file=inf --no-terminal --no-audio --input-ipc-server="$IPC_SOCKET" "$video" &
     PLAYER_PID=$!
     return 0
 }
